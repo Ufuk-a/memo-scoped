@@ -1,0 +1,1378 @@
+#!/usr/bin/env python3
+"""memo-scoped: OptMem with scopes, a permanent append-only memory.
+
+  {memo} init                        create this memory.
+  {memo} wake [scope ...] [--part K/N]
+                                     read your memory. Run first, every session.
+                                     --part: only slice K of N (for hook caps).
+  {memo} note "..." [--scope S]      record one memory: one short line.
+  {memo} nap [<node> "..."]          do the pending compressions.
+  {memo} nap --json [--all]          the next (or every) pending nap, as JSON.
+  {memo} edit <id> "..."             rewrite one memory in place.
+  {memo} move <ids|--match RE> --to S [--from S] [--yes]
+                                     retag memories into another scope.
+  {memo} drop <ids>                  hide memories (recall --all still sees them).
+  {memo} recall <regex> [--scope S] [--all]
+                                     search every memory and every summary.
+  {memo} zoom <node|id>              open a tree node: its children.
+  {memo} scopes                      every scope: leaves, pending naps, summary.
+  {memo} map [SCOPE [PATH]]          folder->scope links (scopes.map): list them,
+                                     or link PATH (default: here) to SCOPE, so
+                                     wake there wakes it and note defaults to it.
+  {memo} map --rm [PATH]             remove PATH's link (default: here).
+  {memo} forget <node>               drop a bad summary; nap rebuilds it.
+  {memo} config [NAME=N]             show this memory's sizes, or change one.
+  {memo} import-v1 <v1-dir> <tsv>    one-time migration from OptMem v1.
+  {memo} check                       replay the journal and report its health.
+
+The memories live in ~/.optmem/memory2, or in $MEMORY_DIR if set.
+"Here" is $MEMO_CWD if set (a proxy from another machine sets it), else cwd.
+ids are integers (`#12`), tree nodes are hash prefixes (`#a1b2c3`).
+"""
+
+import datetime
+import fcntl
+import hashlib
+import json
+import os
+import re
+import sys
+
+# The store is UTF-8 by construction, so the tool reads and prints UTF-8
+# no matter what the machine's locale says.
+for _s in (sys.stdout, sys.stderr):
+    if hasattr(_s, "reconfigure"):
+        _s.reconfigure(encoding="utf-8")
+
+
+def pretty(p):
+    """A path as the user would type it: keep symlinks, fold $HOME to ~."""
+    p, home = os.path.abspath(p), os.path.expanduser("~")
+    return "~" + p[len(home):] if p.startswith(home + os.sep) else p
+
+
+ME = pretty(__file__)
+
+# The sizes a memory may override in its own `config` file.
+KNOBS = {
+    "WAKE_CHARS": (19000, "the memory context: how many bytes wake prints"),
+    "CORE_CHARS": (5000, "of those, how many are reserved for scope core"),
+    "ENTRY_CHARS": (280, "the longest one memory or summary may be, in bytes"),
+    "FANOUT": (4, "tree shape: mean number of children per node"),
+    "DORMANT_LINES": (20, "how many non-woken scopes wake lists, one line each"),
+    "ROOT_STALE": (6, "new memories in a scope before its summary is re-asked"),
+}
+WAKE_CHARS = KNOBS["WAKE_CHARS"][0]
+CORE_CHARS = KNOBS["CORE_CHARS"][0]
+ENTRY_CHARS = KNOBS["ENTRY_CHARS"][0]
+FANOUT = KNOBS["FANOUT"][0]
+DORMANT_LINES = KNOBS["DORMANT_LINES"][0]
+ROOT_STALE = KNOBS["ROOT_STALE"][0]
+WAKE_FLOOR = 400  # what a woken scope costs at least: header, marker, one line
+
+SCOPE_RE = re.compile(r"[a-z0-9_-]+(/[a-z0-9_-]+)*")
+HASH_SHOW = 6  # how many hex digits of a node hash the tool prints
+V1_LOG_REC = 320  # v1 fixed-width record sizes, for import-v1
+V1_TREE_REC = 288
+
+
+def die(msg):
+    print(msg, file=sys.stderr)
+    sys.exit(1)
+
+
+def plural(n, word):
+    if n == 1:
+        return "1 " + word
+    if word == "leaf":
+        word = "leave"
+    elif word.endswith("y"):
+        word = word[:-1] + "ie"
+    elif word.endswith(("s", "h", "x")):
+        word += "e"
+    return "%d %ss" % (n, word)
+
+
+def nbytes(line):
+    """What one printed line costs: its UTF-8 bytes plus the newline."""
+    return len(line.encode()) + 1
+
+
+# ---------------------------------------------------------------- store
+
+def memory_dir():
+    return os.path.expanduser(os.environ.get("MEMORY_DIR") or "~/.optmem/memory2")
+
+
+def store():
+    """The store directory, which only `init` may create: a typo in
+    MEMORY_DIR must be an error, not a second empty identity."""
+    d = memory_dir()
+    if not os.path.isdir(d):
+        die("No memory at %s.\nTo create one, run: %s init\n"
+            "To use an existing one, point MEMORY_DIR at it." % (d, ME))
+    os.makedirs(os.path.join(d, "cache"), exist_ok=True)
+    return d
+
+
+def log_path(d):
+    return os.path.join(d, "LOG.jsonl")
+
+
+def summaries_path(d):
+    return os.path.join(d, "cache", "summaries.jsonl")
+
+
+def roots_path(d):
+    return os.path.join(d, "cache", "roots.jsonl")
+
+
+class locked:
+    """`with locked(d):` -- the one lock every write takes."""
+
+    def __init__(self, d):
+        self.path = os.path.join(d, ".lock")
+
+    def __enter__(self):
+        self.f = open(self.path, "a")
+        fcntl.flock(self.f, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        self.f.close()
+
+
+def append_json(path, objs):
+    """Append records to a jsonl file: one line each, fsync'd. Callers hold
+    the lock. A crash may have left a partial last line: it is finished with
+    a newline first, so it stays one (malformed, ignored) line instead of
+    swallowing the record appended after it."""
+    with open(path, "a+b") as f:
+        f.seek(0, os.SEEK_END)
+        if f.tell() > 0:
+            f.seek(-1, os.SEEK_END)
+            if f.read(1) != b"\n":
+                f.write(b"\n")
+        for o in objs:
+            f.write((json.dumps(o, ensure_ascii=False) + "\n").encode())
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def read_jsonl(path):
+    """Every line of a jsonl file, as (lineno, obj|None, raw). A last line
+    with no newline is a crash remnant: dropped, and reported as truncated."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except FileNotFoundError:
+        return [], False
+    truncated = bool(data) and not data.endswith(b"\n")
+    parts = data.split(b"\n")
+    remnant = parts.pop() if truncated else None
+    out = []
+    for n, raw in enumerate(parts, 1):
+        if not raw.strip():
+            continue
+        try:
+            obj = json.loads(raw.decode())
+            if not isinstance(obj, dict):
+                obj = None
+        except (UnicodeDecodeError, ValueError):
+            obj = None
+        out.append((n, obj, raw))
+    return out, remnant
+
+
+# ---------------------------------------------------------------- config
+
+def size(k, v, where=""):
+    if not v.isdigit() or int(v) < (0 if k == "DORMANT_LINES" else 1):
+        die("%s%s must be a positive whole number, not '%s'." % (where, k, v))
+    if k == "FANOUT" and int(v) < 2:
+        die("%sFANOUT is at least 2." % where)
+    return int(v)
+
+
+def overrides(d, lenient=False):
+    """The knobs this memory sets for itself. lenient: report a bad line
+    and skip it instead of stopping, so `config` can always repair it."""
+    out = {}
+    p = os.path.join(d, "config")
+    if not os.path.exists(p):
+        return out
+    complain = (lambda msg: print(msg, file=sys.stderr)) if lenient else die
+    with open(p, encoding="utf-8") as f:
+        lines = f.readlines()
+    for n, line in enumerate(lines, 1):
+        line = line.split("#")[0].strip()
+        if "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k, v = k.strip().upper(), v.strip()
+        where = "%s line %d: " % (pretty(p), n)
+        if k not in KNOBS:
+            complain("%s%s is not a size. Delete the line, or name one of: %s."
+                     % (where, k, ", ".join(KNOBS)))
+        elif lenient and (not v.isdigit() or int(v) < (0 if k == "DORMANT_LINES" else 1)):
+            complain("%s%s must be a positive whole number, not '%s'." % (where, k, v))
+        else:
+            out[k] = size(k, v, where)
+    return out
+
+
+def config(d):
+    for k, v in overrides(d).items():
+        globals()[k] = v
+
+
+def write_config(d, over):
+    out = ["# memo sizes for this memory. A commented line means: follow the",
+           "# tool's default. Edit with `%s config NAME=VALUE`." % ME, ""]
+    for k, (default, what) in KNOBS.items():
+        out.append("%-2s%-14s = %-6d # %s"
+                   % ("" if k in over else "# ", k, over.get(k, default), what))
+    with open(os.path.join(d, "config"), "w", encoding="utf-8") as f:
+        f.write("\n".join(out) + "\n")
+
+
+# ---------------------------------------------------------------- scopes
+
+def valid_scope(s):
+    return bool(SCOPE_RE.fullmatch(s))
+
+
+def check_scope(s):
+    if not valid_scope(s):
+        die("'%s' is not a scope name: [a-z0-9_-]+ parts joined by '/'." % s)
+    return s
+
+
+def scope_map(d):
+    """scopes.map: `path  scope` per line, `#` comments, `~` expanded."""
+    out = []
+    p = os.path.join(d, "scopes.map")
+    if not os.path.exists(p):
+        return out
+    with open(p, encoding="utf-8") as f:
+        lines = f.readlines()
+    for n, line in enumerate(lines, 1):
+        line = line.split("#")[0].strip()
+        if not line:
+            continue
+        parts = line.split()
+        if len(parts) != 2 or not valid_scope(parts[1]):
+            die("%s line %d: expected `path  scope`, got: %s"
+                % (pretty(p), n, line))
+        out.append((os.path.abspath(os.path.expanduser(parts[0])), parts[1]))
+    return out
+
+
+def here():
+    """The folder the caller is in: $MEMO_CWD when a proxy ran us on its
+    behalf over ssh (whose own cwd is just $HOME), else our cwd."""
+    return os.path.abspath(os.environ.get("MEMO_CWD") or os.getcwd())
+
+
+def cwd_matches(d):
+    """Every scopes.map entry whose path is a prefix of cwd, longest first."""
+    cwd = here()
+    hits = [(path, s) for path, s in scope_map(d)
+            if cwd == path or cwd.startswith(path.rstrip(os.sep) + os.sep)]
+    hits.sort(key=lambda ps: -len(ps[0]))
+    return [s for _, s in hits]
+
+
+def cwd_scope(d):
+    """The scope `note` uses without --scope: the longest match, else core."""
+    hits = cwd_matches(d)
+    return hits[0] if hits else "core"
+
+
+# ---------------------------------------------------------------- journal
+
+def now_ts():
+    return datetime.datetime.now().replace(microsecond=0).isoformat()
+
+
+def text_error(text):
+    """Why a text is not a valid memory, or None."""
+    if not text:
+        return "Empty. A memory is one line of text."
+    if any(ord(c) < 32 or ord(c) == 127 for c in text):
+        return ("Control characters (newlines, tabs) are not allowed. A memory "
+                "is one line: merge them, or note them separately.")
+    n = len(text.encode())
+    if n > ENTRY_CHARS:
+        return ("Too long: %d bytes, limit %d. Accented characters cost 2 bytes. "
+                "Compress it further." % (n, ENTRY_CHARS))
+    return None
+
+
+def check_text(text):
+    text = text.strip()
+    err = text_error(text)
+    if err:
+        die(err)
+    return text
+
+
+def valid_ids(v):
+    return isinstance(v, list) and all(isinstance(i, int) for i in v)
+
+
+def replay(d):
+    """The effective leaf set: every journal line, applied in order.
+    Returns (leaves by id, malformed [(lineno, why)], truncated, max_id).
+
+    max_id is the largest id mentioned by ANY line, malformed, duplicate or
+    truncated included: a crash remnant is sealed into a valid line by the
+    next append, so its id must never be handed out again."""
+    leaves, bad, max_id = {}, [], -1
+    lines, remnant = read_jsonl(log_path(d))
+    truncated = remnant is not None
+    for raw in [raw for _, _, raw in lines] + ([remnant] if truncated else []):
+        for mm in re.finditer(rb'"id"\s*:\s*(\d+)', raw):
+            max_id = max(max_id, int(mm.group(1)))
+    for n, o, raw in lines:
+        t = o.get("t") if o else None
+        if t == "note":
+            ok = (isinstance(o.get("id"), int) and isinstance(o.get("ts"), str)
+                  and isinstance(o.get("text"), str)
+                  and isinstance(o.get("scope"), str) and valid_scope(o["scope"])
+                  and o["id"] not in leaves)
+            if ok:
+                leaves[o["id"]] = {"id": o["id"], "ts": o["ts"], "scope": o["scope"],
+                                   "text": o["text"], "dropped": False}
+        elif t == "edit":
+            ok = isinstance(o.get("id"), int) and isinstance(o.get("text"), str)
+            if ok and o["id"] in leaves:
+                leaves[o["id"]]["text"] = o["text"]
+        elif t == "move":
+            ok = (valid_ids(o.get("ids")) and isinstance(o.get("scope"), str)
+                  and valid_scope(o["scope"]))
+            if ok:
+                for i in o["ids"]:
+                    if i in leaves:
+                        leaves[i]["scope"] = o["scope"]
+        elif t == "drop":
+            ok = valid_ids(o.get("ids"))
+            if ok:
+                for i in o["ids"]:
+                    if i in leaves:
+                        leaves[i]["dropped"] = True
+        else:
+            ok = False
+        if not ok:
+            bad.append((n, raw[:60].decode("utf-8", "replace")))
+    return leaves, bad, truncated, max_id
+
+
+def read_summaries(d):
+    """node hash -> text. Last line per node wins; a null text is a tombstone."""
+    out, bad = {}, 0
+    lines, _ = read_jsonl(summaries_path(d))
+    for n, o, raw in lines:
+        if not o or not isinstance(o.get("node"), str):
+            bad += 1
+            continue
+        if o.get("text") is None:
+            out.pop(o["node"], None)
+        elif isinstance(o["text"], str):
+            out[o["node"]] = o["text"]
+        else:
+            bad += 1
+    return out, bad
+
+
+# ---------------------------------------------------------------- tree
+
+def read_roots(d):
+    """scope -> {"root", "nleaves", "text"}: the scope summaries, last wins."""
+    out = {}
+    lines, _ = read_jsonl(roots_path(d))
+    for _, o, _ in lines:
+        if (o and isinstance(o.get("scope"), str) and isinstance(o.get("root"), str)
+                and isinstance(o.get("nleaves"), int) and isinstance(o.get("text"), str)):
+            out[o["scope"]] = o
+    return out
+
+
+def sha1(s):
+    return hashlib.sha1(s.encode()).hexdigest()
+
+
+def leaf_hash(leaf):
+    return sha1("%d\t%s\t%s" % (leaf["id"], leaf["ts"], leaf["text"]))
+
+
+def closes_chunk(h):
+    return int(sha1(h)[:8], 16) % FANOUT == 0
+
+
+class Node:
+    __slots__ = ("hash", "children", "complete", "level", "seq")
+
+    def __init__(self, h, children, complete, level, seq):
+        self.hash, self.children = h, children
+        self.complete, self.level, self.seq = complete, level, seq
+
+
+class Tree:
+    """The tree of one scope: a pure function of its live leaves.
+
+    Level 0 = leaves sorted by (ts, id). On each level, item i closes a
+    chunk iff its hash says so (closes_chunk) AND the chunk already holds
+    another item, or it is the last item of the level: a singleton never
+    closes, it joins the next chunk, so no node has one child. The one
+    exception is a last item with nothing to join: it is carried up as
+    itself. Every level shrinks, so this terminates. Chunks become the
+    nodes of the next level; repeat until one item: the root.
+
+    A node is complete iff it closed by the hash rule AND its last child is
+    complete (a leaf, or a complete node): a chunk that merely contains the
+    open tail is still open, since its contents keep changing. Only complete
+    nodes get summaries; open ones always print their children."""
+
+    def __init__(self, scope, leaves):
+        self.scope = scope
+        self.leaves = {}  # leaf hash -> leaf
+        self.nodes = {}   # node hash -> Node
+        order = sorted(leaves, key=lambda l: (l["ts"], l["id"]))
+        level = []
+        for leaf in order:
+            h = leaf_hash(leaf)
+            self.leaves[h] = leaf
+            level.append(h)
+        depth, seq = 1, 0
+        while len(level) > 1:
+            nxt, chunk = [], []
+            for i, h in enumerate(level):
+                chunk.append(h)
+                if not (closes_chunk(h) and len(chunk) > 1) and i < len(level) - 1:
+                    continue
+                if len(chunk) == 1:  # the level's last item, alone: carried up
+                    nxt.append(h)
+                else:
+                    nh = sha1("\n".join(chunk))
+                    complete = closes_chunk(h) and (h in self.leaves or self.nodes[h].complete)
+                    self.nodes[nh] = Node(nh, chunk, complete, depth, seq)
+                    seq += 1
+                    nxt.append(nh)
+                chunk = []
+            level, depth = nxt, depth + 1
+        self.root = level[0] if level else None
+
+    def is_leaf(self, h):
+        return h in self.leaves
+
+    def leaf_set(self, h):
+        """Every leaf id under an item (the item itself, if a leaf)."""
+        if h in self.leaves:
+            return {self.leaves[h]["id"]}
+        out = set()
+        for c in self.nodes[h].children:
+            out |= self.leaf_set(c)
+        return out
+
+
+# ---------------------------------------------------------------- model
+
+class Model:
+    """Everything one invocation knows: the replayed journal, the summary
+    cache, and one Tree per scope. Built once per command."""
+
+    def __init__(self, d):
+        self.d = d
+        self.leaves, self.malformed, self.truncated, max_id = replay(d)
+        self.summaries, self.bad_summaries = read_summaries(d)
+        self.roots = read_roots(d)
+        self.next_id = max(max_id, max(self.leaves, default=-1)) + 1
+        by_scope = {}
+        for leaf in self.leaves.values():
+            if not leaf["dropped"]:
+                by_scope.setdefault(leaf["scope"], []).append(leaf)
+        self.trees = {s: Tree(s, ls) for s, ls in by_scope.items()}
+        self.where = {}  # any hash (leaf or node) -> scope
+        for s, t in self.trees.items():
+            for h in t.leaves:
+                self.where[h] = s
+            for h in t.nodes:
+                self.where[h] = s
+
+    def scopes(self):
+        return sorted(self.trees)
+
+    def count(self, scope):
+        return len(self.trees[scope].leaves) if scope in self.trees else 0
+
+    def root_stale(self, scope):
+        """Does the scope want a (new) scope summary? Yes if it has none, or
+        ROOT_STALE memories arrived since the last one."""
+        r = self.roots.get(scope)
+        return r is None or self.count(scope) - r["nleaves"] >= ROOT_STALE
+
+    def pending(self, scope=None, roots=False):
+        """Complete nodes with every child settled (a leaf, or summarised)
+        that have no summary themselves: bottom-up, oldest first. With
+        roots=True (explicit `nap` only, never after a write: the root hash
+        changes with every note), then the open roots of scopes whose scope
+        summary is missing or ROOT_STALE memories old."""
+        out, want = [], []
+        for s in self.scopes() if scope is None else [scope]:
+            t = self.trees.get(s)
+            if not t:
+                continue
+            todo = []
+            for n in t.nodes.values():
+                if n.complete and n.hash not in self.summaries and all(
+                        t.is_leaf(c) or c in self.summaries for c in n.children):
+                    todo.append((n.level, n.seq, s, n.hash))
+            out += todo
+            if (roots and not todo and t.root in t.nodes
+                    and not t.nodes[t.root].complete and self.root_stale(s)):
+                want.append((s, t.root))
+        out.sort()
+        return [(s, h) for _, _, s, h in out] + want
+
+    def resolve(self, prefix, pool=None):
+        """A node hash from a prefix, as wake prints them (`#a1b2c3`)."""
+        p = prefix.lstrip("#").lower()
+        if not re.fullmatch(r"[0-9a-f]+", p):
+            die("'%s' is not a node id. Copy it from wake, like #a1b2c3." % prefix)
+        pool = self.where if pool is None else pool
+        hits = [h for h in pool if h.startswith(p)]
+        if not hits:
+            die("No node #%s. Run: %s wake" % (p, ME))
+        if len(hits) > 1:
+            die("#%s is ambiguous (%d nodes). Use a longer prefix." % (p, len(hits)))
+        return hits[0]
+
+    def line(self, h):
+        """One printed line for an item: a leaf, or a summarised node."""
+        t = self.trees[self.where[h]]
+        if t.is_leaf(h):
+            return leaf_line(t.leaves[h])
+        s = self.summaries.get(h)
+        return "#%s %s" % (h[:HASH_SHOW], s if s is not None else "(no summary yet)")
+
+    def root_summary(self, scope):
+        """The scope in one line: its scope summary (with " (+N)" for the
+        memories since), else its complete root's summary, else the newest
+        summary among the root's children, else nothing."""
+        t = self.trees.get(scope)
+        if not t:
+            return "(no summary yet)"
+        r = self.roots.get(scope)
+        if r:
+            n = self.count(scope) - r["nleaves"]
+            return r["text"] + (" (+%d)" % n if n > 0 else "")
+        if t.root in self.summaries:
+            return self.summaries[t.root]
+        if t.root in t.nodes:
+            for c in reversed(t.nodes[t.root].children):
+                if c in self.summaries:
+                    return "(newest era) " + self.summaries[c]
+        return "(no summary yet)"
+
+
+def leaf_line(leaf):
+    return "#%d %s %s" % (leaf["id"], leaf["ts"][:10], leaf["text"])
+
+
+def journal(d, objs):
+    with locked(d):
+        append_json(log_path(d), objs)
+
+
+# ---------------------------------------------------------------- wake
+
+def render_min(m, t, h):
+    """The least an item can print as: a leaf line; a summary line for a
+    summarised complete node; otherwise its children, recursively. Returns
+    (entries, stale): entries are (hash, line, expandable), stale says an
+    unsummarised complete node was forced open."""
+    if t.is_leaf(h):
+        return [(h, m.line(h), False)], False
+    n = t.nodes[h]
+    if (n.complete or h == t.root) and h in m.summaries:
+        return [(h, m.line(h), True)], False
+    out, stale = [], n.complete
+    for c in n.children:
+        e, s = render_min(m, t, c)
+        out += e
+        stale = stale or s
+    return out, stale
+
+
+def frontier(m, scope, budget):
+    """The lines wake prints for one scope: header, then the tree opened
+    from the root, most recent node first, while the budget allows.
+    Returns (lines, bytes)."""
+    t = m.trees.get(scope)
+    header = "== %s (%s)" % (scope, plural(m.count(scope), "memory"))
+    if not t:
+        return [header], nbytes(header)
+    entries, stale = render_min(m, t, t.root)
+    cost = nbytes(header) + sum(nbytes(e[1]) for e in entries)
+    while True:
+        idx = next((i for i in range(len(entries) - 1, -1, -1)
+                    if entries[i][2]), None)
+        if idx is None:
+            break
+        rep, s = [], False
+        for c in t.nodes[entries[idx][0]].children:
+            e, cs = render_min(m, t, c)
+            rep += e
+            s = s or cs
+        new = cost - nbytes(entries[idx][1]) + sum(nbytes(e[1]) for e in rep)
+        if s and not stale:
+            new += nbytes(" (stale)") - 1  # the header grows too
+        if new > budget:
+            break
+        entries[idx:idx + 1] = rep
+        cost, stale = new, stale or s
+    if stale:
+        header += " (stale)"
+        cost += nbytes(" (stale)") - 1
+    lines = [e[1] for e in entries]
+    if cost > budget:
+        # The floor (open tail, stale nodes) does not fit: drop the oldest
+        # lines for one marker, keeping at least the newest. Never over budget.
+        gone, marker, pend = 0, "", len(m.pending(scope))
+        while len(lines) > 1 and cost + nbytes(marker) > budget:
+            e = entries.pop(0)
+            lines.pop(0)
+            gone += len(t.leaf_set(e[0]))
+            cost -= nbytes(e[1])
+            marker = ("\u2026 %s omitted (pending naps: %d) \u2014 run %s nap"
+                      % (plural(gone, "older memory"), pend, ME))
+        lines.insert(0, marker)
+        cost += nbytes(marker)
+    return [header] + lines, cost
+
+
+def wake_lines(m, woken):
+    """The whole wake document. Budget: WAKE_CHARS in all; the dormant list
+    and the last line are reserved first, core gets CORE_CHARS, the rest is
+    split evenly among the other woken scopes, and what a scope leaves
+    unused flows to the next."""
+    pend = len(m.pending())
+    last = "pending naps: %d | bytes: %%d | You are awake." % pend
+
+    def dormant_tail(woken):
+        dormant = ([s for s in woken_all if s not in woken] +
+                   [s for s in m.scopes() if s not in woken_all])[:DORMANT_LINES]
+        tail = ["-- other scopes:"] if dormant else []
+        for s in dormant:
+            tail.append("%s (%d): %s" % (s, m.count(s), m.root_summary(s)))
+        return tail, WAKE_CHARS - sum(nbytes(l) for l in tail) - nbytes(last % 10 ** 9)
+
+    # Too many woken scopes cannot fit: each costs at least WAKE_FLOOR. Keep
+    # the first that do (core, cwd-mapped, args, in order), list the rest.
+    woken_all = list(woken)
+    tail, room = dormant_tail(woken)
+    fits = 1 + max(0, (room - min(CORE_CHARS, room)) // WAKE_FLOOR)
+    if fits < len(woken):
+        woken = woken[:fits]
+        tail, room = dormant_tail(woken)
+    others = [s for s in woken if s != "core"]
+    core = CORE_CHARS if others else room  # alone, core takes the whole room
+    share = (room - CORE_CHARS) // len(others) if others else 0
+    out, carry = [], 0
+    for s in woken:
+        budget = (core if s == "core" else share) + carry
+        lines, cost = frontier(m, s, budget)
+        out += lines
+        carry = budget - cost
+    out += tail
+    total = sum(nbytes(l) for l in out)
+    b = total
+    for _ in range(3):  # the byte count includes its own line
+        b = total + nbytes(last % b)
+    out.append(last % b)
+    return out
+
+
+# Claude Code (>= 2.1.251) shows a hook's output inline only up to ~10,000
+# chars; past that it saves it to a file and shows a 2 KB preview. `wake
+# --part K/N` prints the K-th of N near-equal line-aligned slices, so N hook
+# entries each stay under the cap. A slice over PART_WARN bytes says so.
+PART_WARN = 9500
+
+
+def wake_part(lines, k, n):
+    """Slice k (1-based) of n: cut where the running byte count crosses
+    i*total/n, never inside a line. Every line lands in exactly one slice."""
+    sizes = [nbytes(l) for l in lines]
+    total, run, out = sum(sizes), 0, [[] for _ in range(n)]
+    for l, b in zip(lines, sizes):
+        i = min(n - 1, run * n // total) if total else 0
+        out[i].append(l)
+        run += b
+    part = out[k - 1]
+    if sum(nbytes(l) for l in part) > PART_WARN:
+        part = part + ["(memo: wake part %d/%d is over %d bytes; Claude Code "
+                       "may truncate it. Add a hook entry and raise N.)"
+                       % (k, n, PART_WARN)]
+    return part
+
+
+def cmd_wake(d, args):
+    part = None
+    if "--part" in args:
+        i = args.index("--part")
+        mt = re.fullmatch(r"(\d+)/(\d+)", args[i + 1] if i + 1 < len(args) else "")
+        if not mt or not 1 <= int(mt.group(1)) <= int(mt.group(2)):
+            die("--part wants K/N with 1 <= K <= N, e.g. --part 1/3")
+        part = (int(mt.group(1)), int(mt.group(2)))
+        args = args[:i] + args[i + 2:]
+    m = Model(d)
+    woken = ["core"]
+    for s in cwd_matches(d) + [check_scope(a) for a in args]:
+        if s not in woken:
+            woken.append(s)
+    lines = wake_lines(m, woken)
+    if part:
+        lines = wake_part(lines, *part)
+    if lines:
+        print("\n".join(lines))
+
+
+# ---------------------------------------------------------------- naps
+
+def nap_prompt(m, scope, h, left):
+    t = m.trees[scope]
+    n = t.nodes[h]
+    lines = []
+
+    def show(c, depth):
+        if t.is_leaf(c) or c in m.summaries:
+            lines.append("  " * depth + m.line(c))
+        else:  # an open node (root naps only): open it, all the way down
+            lines.append("  " * depth + "#%s (open):" % c[:HASH_SHOW])
+            for g in t.nodes[c].children:
+                show(g, depth + 1)
+    for c in n.children:
+        show(c, 1)
+    what = "the whole scope %s (root #%s)" % (scope, h[:HASH_SHOW]) if \
+        h == t.root else "node #%s (scope %s)" % (h[:HASH_SHOW], scope)
+    tail = "" if not left else "\n%s after this one." % plural(left, "nap")
+    return ("Compress %s, %s, into one line of at most %d bytes.\n"
+            "Keep what has lasting effect, drop what does not. Invent "
+            "nothing.\n\n%s\n%s\nRun: %s nap %s \"<your line>\""
+            % (what, plural(len(n.children), "item"), ENTRY_CHARS,
+               "\n".join(lines), tail, ME, h[:HASH_SHOW]))
+
+
+def v1_hints(m):
+    """cache/v1_hints.txt as [(from_date, to_date, line)], dated by the v1
+    ids (= v2 ids after import-v1) the block covered. Empty if absent."""
+    out = []
+    p = os.path.join(m.d, "cache", "v1_hints.txt")
+    if not os.path.exists(p):
+        return out
+    with open(p, encoding="utf-8") as f:
+        for line in f:
+            line = line.rstrip("\n")
+            mm = re.match(r"#(\d+)-(\d+)\t", line)
+            if not mm:
+                continue
+            days = [m.leaves[i]["ts"][:10] for i in range(int(mm.group(1)), int(mm.group(2)) + 1)
+                    if i in m.leaves]
+            if days:
+                out.append((min(days), max(days), line.replace("\t", " ", 1)))
+    return out
+
+
+def nap_json(m, scope, h, left, hints):
+    """One pending nap as a JSON-able dict, for a batch driver. Open
+    children (root naps) are flattened into their leaves and summaries."""
+    t = m.trees[scope]
+    n = t.nodes[h]
+    children = []
+
+    def flat(c):
+        if t.is_leaf(c):
+            l = t.leaves[c]
+            children.append({"kind": "leaf", "id": l["id"], "ts": l["ts"], "text": l["text"]})
+        elif c in m.summaries:
+            children.append({"kind": "summary", "node": c, "text": m.summaries[c]})
+        else:
+            for g in t.nodes[c].children:
+                flat(g)
+    for c in n.children:
+        flat(c)
+    ids = t.leaf_set(h)
+    ts = sorted(m.leaves[i]["ts"] for i in ids)
+    lo, hi = ts[0][:10], ts[-1][:10]
+    return {"node": h, "scope": scope, "level": n.level,
+            "span": {"from_ts": ts[0], "to_ts": ts[-1], "leaves": len(ids)},
+            "children": children,
+            "hints": [line for a, b, line in hints if a <= hi and b >= lo],
+            "remaining": left}
+
+
+def next_nap(m, roots=False):
+    todo = m.pending(roots=roots)
+    if not todo:
+        return None
+    s, h = todo[0]
+    return nap_prompt(m, s, h, len(todo) - 1)
+
+
+def cmd_nap(d, args):
+    m = Model(d)
+    said = False
+    if args and args[0] == "--json":
+        if args[1:] not in ([], ["--all"]):
+            die("usage: %s nap --json [--all]" % ME)
+        todo = m.pending(roots=True)
+        hints = v1_hints(m) if todo else []
+        naps = [nap_json(m, s, h, len(todo) - i - 1, hints) for i, (s, h) in enumerate(todo)]
+        out = naps if args[1:] else (naps[0] if naps else None)
+        print(json.dumps(out, ensure_ascii=False, indent=1))
+        return
+    if args:
+        if len(args) != 2:
+            die("usage: %s nap <node> \"<one line>\"" % ME)
+        h = m.resolve(args[0])
+        t = m.trees[m.where[h]]
+        if t.is_leaf(h):
+            die("#%s is a memory, not a node. Only nodes get summaries." % args[0])
+        if not t.nodes[h].complete and h != t.root:
+            die("#%s is the open tail of its scope: it is shown raw, never "
+                "summarised. Run: %s nap" % (args[0], ME))
+        text = check_text(args[1])
+        scope = m.where[h]
+        if h == t.root and not t.nodes[h].complete:
+            rec = {"scope": scope, "root": h, "nleaves": m.count(scope), "text": text}
+            with locked(d):
+                append_json(roots_path(d), [rec])
+            m.roots[scope] = rec
+            print("Scope %s summarised (#%s)." % (scope, h[:HASH_SHOW]))
+        else:
+            with locked(d):
+                append_json(summaries_path(d), [{"node": h, "text": text}])
+            m.summaries[h] = text
+            print("#%s saved." % h[:HASH_SHOW])
+        said = True
+    nap = next_nap(m, roots=True)
+    if not nap:
+        print("Nothing left to compress.")
+        return
+    print(("\n" if said else "") + nap)
+
+
+def cmd_forget(d, args):
+    if len(args) != 1:
+        die("usage: %s forget <node>" % ME)
+    m = Model(d)
+    h = m.resolve(args[0], pool=m.summaries)
+    with locked(d):
+        append_json(summaries_path(d), [{"node": h, "text": None}])
+    print("Forgot #%s. Run: %s nap" % (h[:HASH_SHOW], ME))
+
+
+# ---------------------------------------------------------------- writes
+
+def cmd_note(d, args):
+    scope = None
+    ts = None
+    rest = []
+    i = 0
+    while i < len(args):
+        if args[i] == "--scope" and i + 1 < len(args):
+            scope = check_scope(args[i + 1])
+            i += 2
+        elif args[i] == "--ts" and i + 1 < len(args):
+            # Backdate a memory (migration/bookkeeping only). ISO seconds or a
+            # bare date, which becomes noon of that day so it sorts sensibly.
+            ts = args[i + 1]
+            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", ts):
+                ts += "T12:00:00"
+            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}", ts):
+                die("--ts wants YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS")
+            i += 2
+        else:
+            rest.append(args[i])
+            i += 1
+    if len(rest) != 1:
+        die("usage: %s note \"<one line, at most %d bytes>\" [--scope S] [--ts T]"
+            % (ME, ENTRY_CHARS))
+    text = check_text(rest[0])
+    if scope is None:
+        scope = cwd_scope(d)
+    with locked(d):
+        m = Model(d)  # the id is chosen under the lock: no two notes share one
+        rec = {"t": "note", "id": m.next_id, "ts": ts or now_ts(),
+               "scope": scope, "text": text}
+        append_json(log_path(d), [rec])
+    print("Saved as #%d in scope %s." % (rec["id"], scope))
+    nap = next_nap(Model(d))
+    if nap:
+        print("\n" + nap)
+
+
+def parse_ids(spec):
+    """`300-303,306,309-315` (a `#` prefix is fine) -> sorted ids."""
+    out = set()
+    for part in spec.split(","):
+        part = part.strip().lstrip("#")
+        if not part:
+            continue
+        mm = re.fullmatch(r"(\d+)(?:-#?(\d+))?", part)
+        if not mm:
+            die("'%s' is not an id or a range like 300-303." % part)
+        lo, hi = int(mm.group(1)), int(mm.group(2) or mm.group(1))
+        if hi < lo:
+            die("'%s': the range runs backwards." % part)
+        out |= set(range(lo, hi + 1))
+    if not out:
+        die("No ids given.")
+    return sorted(out)
+
+
+def cmd_edit(d, args):
+    if len(args) != 2:
+        die("usage: %s edit <id> \"<one line>\"" % ME)
+    ids = parse_ids(args[0])
+    if len(ids) != 1:
+        die("edit takes exactly one id.")
+    text = check_text(args[1])
+    with locked(d):
+        m = Model(d)
+        if ids[0] not in m.leaves:
+            die("No memory #%d." % ids[0])
+        append_json(log_path(d), [{"t": "edit", "id": ids[0], "text": text}])
+    print("Edited #%d." % ids[0])
+    nap = next_nap(Model(d))
+    if nap:
+        print("\n" + nap)
+
+
+def confirm(question):
+    print(question + " [y/N] ", end="", flush=True)
+    return sys.stdin.readline().strip().lower() in ("y", "yes")
+
+
+def cmd_move(d, args):
+    src = dst = pattern = None
+    yes, spec = False, None
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("--to", "--from", "--match") and i + 1 < len(args):
+            v = args[i + 1]
+            if a == "--to":
+                dst = check_scope(v)
+            elif a == "--from":
+                src = check_scope(v)
+            else:
+                try:
+                    pattern = re.compile(v, re.I)
+                except re.error as e:
+                    die("bad regex: %s" % e)
+            i += 2
+        elif a == "--yes":
+            yes, i = True, i + 1
+        elif spec is None and not a.startswith("--"):
+            spec, i = a, i + 1
+        else:
+            die("usage: %s move <ids|--match REGEX> [--from S] --to S [--yes]" % ME)
+    if dst is None or (spec is None) == (pattern is None):
+        die("usage: %s move <ids|--match REGEX> [--from S] --to S [--yes]" % ME)
+    m = Model(d)
+    if spec is not None:
+        chosen = []
+        for i in parse_ids(spec):
+            if i not in m.leaves:
+                die("No memory #%d." % i)
+            chosen.append(m.leaves[i])
+    else:
+        chosen = [l for l in sorted(m.leaves.values(), key=lambda l: l["id"])
+                  if not l["dropped"] and pattern.search(l["text"])]
+    chosen = [l for l in chosen if (src is None or l["scope"] == src)
+              and l["scope"] != dst]
+    if not chosen:
+        print("Nothing to move.")
+        return
+    for l in chosen:
+        print("[%s] %s%s" % (l["scope"], "(dropped) " if l["dropped"] else "", leaf_line(l)))
+    ids = [l["id"] for l in chosen]
+    if not yes and not confirm("Move %s to scope %s?" % (plural(len(ids), "memory"), dst)):
+        print("Not moved.")
+        return
+    journal(d, [{"t": "move", "ids": ids, "scope": dst}])
+    print("Moved %s to scope %s." % (plural(len(ids), "memory"), dst))
+    nap = next_nap(Model(d))
+    if nap:
+        print("\n" + nap)
+
+
+def cmd_drop(d, args):
+    if len(args) != 1:
+        die("usage: %s drop <ids>   # like 12 or 300-303,306" % ME)
+    ids = parse_ids(args[0])
+    m = Model(d)
+    live = []
+    for i in ids:
+        if i not in m.leaves:
+            die("No memory #%d." % i)
+        if not m.leaves[i]["dropped"]:
+            live.append(i)
+    if not live:
+        print("Already dropped.")
+        return
+    journal(d, [{"t": "drop", "ids": live}])
+    print("Dropped %s: %s." % (plural(len(live), "memory"),
+                               ", ".join("#%d" % i for i in live)))
+
+
+# ---------------------------------------------------------------- reads
+
+def cmd_recall(d, args):
+    scope, everything, pats = None, False, []
+    i = 0
+    while i < len(args):
+        if args[i] == "--scope" and i + 1 < len(args):
+            scope, i = check_scope(args[i + 1]), i + 2
+        elif args[i] == "--all":
+            everything, i = True, i + 1
+        else:
+            pats.append(args[i])
+            i += 1
+    if len(pats) != 1:
+        die("usage: %s recall <regex> [--scope S] [--all]" % ME)
+    try:
+        pat = re.compile(pats[0], re.I)
+    except re.error as e:
+        die("bad regex: %s" % e)
+    m = Model(d)
+    out = []
+    for l in sorted(m.leaves.values(), key=lambda l: (l["ts"], l["id"])):
+        if l["dropped"] and not everything:
+            continue
+        if scope and l["scope"] != scope:
+            continue
+        if pat.search(l["text"]):
+            out.append("[%s] %s%s" % (l["scope"], "(dropped) " if l["dropped"]
+                                      else "", leaf_line(l)))
+    for s in m.scopes():
+        if scope and s != scope:
+            continue
+        t = m.trees[s]
+        for n in sorted(t.nodes.values(), key=lambda n: (n.level, n.seq)):
+            text = m.summaries.get(n.hash)
+            if text is not None and pat.search(text):
+                out.append("[%s] #%s %s" % (s, n.hash[:HASH_SHOW], text))
+    if not out:
+        print("No match.")
+        return
+    # The newest matches that fit the wake budget: a vague regex matches
+    # everything, and everything does not fit a harness's output.
+    kept, total = [], 0
+    for line in reversed(out):
+        total += nbytes(line)
+        if total > WAKE_CHARS:
+            break
+        kept.append(line)
+    kept.reverse()
+    print("\n".join(kept))
+    if len(kept) < len(out):
+        print("Newest %d of %s. Narrow the regex." % (len(kept), plural(len(out), "match")))
+    else:
+        print("%s." % plural(len(out), "match"))
+
+
+def cmd_zoom(d, args):
+    if len(args) != 1:
+        die("usage: %s zoom <node|id>" % ME)
+    m = Model(d)
+    if re.fullmatch(r"#?\d+", args[0]) and int(args[0].lstrip("#")) in m.leaves:
+        i = int(args[0].lstrip("#"))  # else it may be an all-digit node prefix
+        l = m.leaves[i]
+        print("[%s] %s%s" % (l["scope"], "(dropped) " if l["dropped"] else "",
+                             leaf_line(l)))
+        return
+    h = m.resolve(args[0])
+    s = m.where[h]
+    t = m.trees[s]
+    if t.is_leaf(h):
+        print("[%s] %s" % (s, leaf_line(t.leaves[h])))
+        return
+    n = t.nodes[h]
+    print("#%s: scope %s, level %d, %s, %s" % (
+        h[:HASH_SHOW], s, n.level, plural(len(n.children), "child"),
+        "complete" if n.complete else "open tail (never summarised)"))
+    for c in n.children:
+        line = m.line(c)
+        if not t.is_leaf(c) and not t.nodes[c].complete:
+            line = "#%s (open tail)" % c[:HASH_SHOW]
+        print("  " + line)
+
+
+def cmd_scopes(d, args):
+    if args:
+        die("usage: %s scopes" % ME)
+    m = Model(d)
+    if not m.trees:
+        print("No memories yet. Record the first with: %s note \"<one line>\"" % ME)
+        return
+    rows = [(s, m.count(s), len(m.pending(s)), m.root_summary(s)) for s in m.scopes()]
+    w = max(len(r[0]) for r in rows)
+    print("%-*s %6s %7s  %s" % (w, "scope", "leaves", "pending", "root summary"))
+    for s, n, p, summ in rows:
+        print("%-*s %6d %7d  %s" % (w, s, n, p, summ))
+
+
+MAP_USAGE = "usage: %s map [SCOPE [PATH]]   |   %s map --rm [PATH]"
+
+
+def map_target(arg):
+    """PATH (relative to here, ~ allowed), or here itself, as an abspath."""
+    p = os.path.abspath(os.path.join(here(), os.path.expanduser(arg or ".")))
+    if re.search(r"[\s#]", p):
+        die("scopes.map can't hold a path with whitespace or '#': %s" % p)
+    if p in (os.sep, os.path.expanduser("~")):
+        die("Refusing to link %s: every folder under it would wake that scope."
+            % pretty(p))
+    return p
+
+
+def cmd_map(d, args):
+    usage = MAP_USAGE % (ME, ME)
+    rm = "--rm" in args
+    args = [a for a in args if a != "--rm"]
+    if any(a.startswith("-") for a in args) or len(args) > (1 if rm else 2):
+        die(usage)
+    p = os.path.join(d, "scopes.map")
+    if not args and not rm:
+        entries = scope_map(d)
+        if not entries:
+            print("No folder is linked to a scope yet. Link one: %s map SCOPE [PATH]" % ME)
+            return
+        at = here().rstrip(os.sep) + os.sep
+        w = max(len(pretty(path)) for path, _ in entries)
+        for path, s in entries:
+            mark = at.startswith(path.rstrip(os.sep) + os.sep)
+            print("%-*s  %s%s" % (w, pretty(path), s, "   <- here" if mark else ""))
+        return
+    scope = None if rm else check_scope(args[0])
+    target = map_target(args[0] if rm and args else (args[1] if len(args) == 2 else None))
+    with locked(d):
+        scope_map(d)  # refuse to rewrite a file we can't parse
+        lines = []
+        if os.path.exists(p):
+            with open(p, encoding="utf-8") as f:
+                lines = f.read().splitlines()
+        old, kept = None, []
+        for line in lines:
+            parts = line.split("#")[0].split()
+            if parts and os.path.abspath(os.path.expanduser(parts[0])) == target:
+                old = parts[1]
+                if rm:
+                    continue
+                line = "%-19s %s" % (pretty(target), scope)
+            kept.append(line)
+        if rm and old is None:
+            die("%s isn't linked to any scope. See: %s map" % (pretty(target), ME))
+        if not rm and old is None:
+            kept.append("%-19s %s" % (pretty(target), scope))
+        if not rm and old == scope:
+            print("%s is already linked to %s." % (pretty(target), scope))
+            return
+        tmp = p + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write("\n".join(kept) + "\n")
+        os.replace(tmp, p)
+    if rm:
+        print("Unlinked %s (was %s)." % (pretty(target), old))
+        return
+    print("Linked %s -> %s%s. Wake there wakes %s; note there defaults to it."
+          % (pretty(target), scope, "" if old is None else " (was %s)" % old, scope))
+    if scope not in Model(d).scopes():
+        print("(%s has no memories yet: it appears on its first note.)" % scope)
+
+
+def cmd_config(d, args):
+    over = overrides(d, lenient=True)
+    for a in args:
+        k, eq, v = a.partition("=")
+        k = k.strip().upper()
+        if not eq or k not in KNOBS:
+            die("usage: %s config [NAME=VALUE ...]   # NAME one of %s"
+                % (ME, ", ".join(KNOBS)))
+        if v.strip():
+            over[k] = size(k, v.strip())
+        else:
+            over.pop(k, None)
+    if args:
+        write_config(d, over)
+    for k, (default, what) in KNOBS.items():
+        print("%-14s %-7d %s%s" % (k, over.get(k, default), what,
+                                   "" if k not in over else
+                                   " (default %d)" % default))
+
+
+def cmd_check(d, args):
+    if args:
+        die("usage: %s check" % ME)
+    m = Model(d)
+    for s in m.scopes():
+        print("%s: %s, %s" % (s, plural(m.count(s), "leaf"),
+                              plural(len(m.pending(s)), "pending nap")))
+    dropped = sum(1 for l in m.leaves.values() if l["dropped"])
+    print("total: %s live, %d dropped, %d pending naps"
+          % (plural(len(m.leaves) - dropped, "leaf"), dropped, len(m.pending())))
+    orphans = [h for h in m.summaries if h not in m.where]
+    print("orphan summaries: %d%s" % (len(orphans), "" if not orphans else
+                                      " (" + ", ".join(h[:HASH_SHOW] for h in orphans) + ")"))
+    print("malformed journal lines: %d" % len(m.malformed))
+    for n, raw in m.malformed:
+        print("  line %d: %s" % (n, raw))
+    print("malformed summary lines: %d" % m.bad_summaries)
+    print("truncated final journal line: %s" % ("yes (a crash; ignored)" if m.truncated else "no"))
+
+
+# ---------------------------------------------------------------- init, import
+
+def cmd_init(d, args):
+    if args:
+        die("usage: %s init" % ME)
+    fresh = not os.path.isdir(d)
+    os.makedirs(os.path.join(d, "cache"), exist_ok=True)
+    open(log_path(d), "a").close()
+    if not os.path.exists(os.path.join(d, "config")):
+        write_config(d, {})
+    p = os.path.join(d, "scopes.map")
+    if not os.path.exists(p):
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("# cwd -> scope for `memo note` and `memo wake`, one per "
+                    "line:\n#   ~/webapp  webapp\n")
+    config(d)
+    if fresh:
+        print("Created %s." % pretty(d))
+    else:
+        print("Found %s: %s." % (pretty(d), plural(len(Model(d).leaves), "memory")))
+    print("Sizes live in %s/config; cwd mapping in %s/scopes.map."
+          % (pretty(d), pretty(d)))
+
+
+def v1_records(path, rec):
+    """The fixed-width records of a v1 file, decoded one by one: slicing
+    decoded text would shift every boundary after a multi-byte character."""
+    with open(path, "rb") as f:
+        buf = f.read()
+    if len(buf) % rec:
+        die("%s is %d bytes, not a multiple of %d: a partial record from a "
+            "crash. v1 repairs it on its next write (any `memo note`), or "
+            "truncate it to %d bytes." % (pretty(path), len(buf), rec,
+                                          len(buf) - len(buf) % rec))
+    return [buf[i * rec:(i + 1) * rec].decode().rstrip() for i in range(len(buf) // rec)]
+
+
+def cmd_import_v1(d, args):
+    if len(args) != 2:
+        die("usage: %s import-v1 <v1-memory-dir> <scope-table.tsv>" % ME)
+    src, table = args
+    m = Model(d)
+    if m.leaves:
+        die("%s already holds %s. import-v1 needs an empty memory, so that "
+            "v1 ids survive." % (pretty(d), plural(len(m.leaves), "memory")))
+    v1log = os.path.join(src, "LOG.txt")
+    if not os.path.exists(v1log):
+        die("No v1 log at %s." % pretty(v1log))
+    scopes = {}
+    with open(table, encoding="utf-8") as f:
+        lines = f.readlines()
+    for n, line in enumerate(lines, 1):
+        line = line.rstrip("\n")
+        if not line.strip() or line.startswith("# "):
+            continue
+        parts = line.split("\t")
+        if len(parts) != 2 or not parts[0].strip().lstrip("#").isdigit():
+            die("%s line %d: expected `id<TAB>scope`, got: %s" % (pretty(table), n, line))
+        scopes[int(parts[0].strip().lstrip("#"))] = check_scope(parts[1].strip())
+    recs = []
+    for k, line in enumerate(v1_records(v1log, V1_LOG_REC)):
+        head, _, rest = line.partition(" ")
+        date, _, text = rest.partition(" ")
+        if not head.startswith("#") or not head[1:].isdigit() or int(head[1:]) != k:
+            die("%s record %d is not `#%d <date> <text>`: %s" % (pretty(v1log), k, k, line[:60]))
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
+            die("%s record %d: bad date %s" % (pretty(v1log), k, date))
+        recs.append({"t": "note", "id": k, "ts": date + "T00:00:00",
+                     "scope": scopes.get(k, "core"), "text": text.strip()})
+    if not recs:
+        die("%s holds no memories." % pretty(v1log))
+    bad = [(r["id"], text_error(r["text"])) for r in recs if text_error(r["text"])]
+    if bad:
+        die("%s: %s would not pass `note`:\n%s" % (
+            pretty(v1log), plural(len(bad), "record"),
+            "\n".join("  #%d: %s" % b for b in bad[:20])))
+    unknown = sorted(i for i in scopes if i >= len(recs))
+    if unknown:
+        die("%s names ids the v1 log does not have: %s"
+            % (pretty(table), ", ".join(str(i) for i in unknown[:10])))
+    # v1 block summaries: not valid here (the tree has other boundaries), but
+    # a fine hint for whoever answers the naps.
+    hints = []
+    tree_dir = os.path.join(src, "TREE")
+    if os.path.isdir(tree_dir):
+        for name in os.listdir(tree_dir):
+            if not name.isdigit():
+                continue
+            s = int(name)
+            for k, text in enumerate(v1_records(os.path.join(tree_dir, name), V1_TREE_REC)):
+                if text:
+                    hints.append((k * s, (k + 1) * s - 1, text))
+    hints.sort()
+    with locked(d):
+        if Model(d).leaves:
+            die("Another session wrote meanwhile; import-v1 needs an empty memory.")
+        append_json(log_path(d), recs)
+        with open(os.path.join(d, "cache", "v1_hints.txt"), "w", encoding="utf-8") as f:
+            for lo, hi, text in hints:
+                f.write("#%d-%d\t%s\n" % (lo, hi, text))
+    m = Model(d)
+    print("Imported %s into %s; %s saved to cache/v1_hints.txt."
+          % (plural(len(recs), "memory"), plural(len(m.trees), "scope"),
+             plural(len(hints), "v1 summary")))
+    print("pending naps: %d. Run: %s nap" % (len(m.pending()), ME))
+
+
+# ---------------------------------------------------------------- main
+
+COMMANDS = {"init": cmd_init, "wake": cmd_wake, "note": cmd_note, "nap": cmd_nap,
+            "edit": cmd_edit, "move": cmd_move, "drop": cmd_drop,
+            "recall": cmd_recall, "zoom": cmd_zoom, "scopes": cmd_scopes,
+            "map": cmd_map,
+            "forget": cmd_forget, "config": cmd_config,
+            "import-v1": cmd_import_v1, "check": cmd_check}
+
+
+def main():
+    usage = __doc__.strip().format(memo=ME)
+    if len(sys.argv) < 2:
+        print(usage)
+        sys.exit(0)
+    cmd = sys.argv[1]
+    if cmd not in COMMANDS:
+        print("No such command: %s\n" % cmd, file=sys.stderr)
+        print(usage, file=sys.stderr)
+        sys.exit(1)
+    try:
+        if cmd == "init":
+            cmd_init(memory_dir(), sys.argv[2:])
+            return
+        d = store()
+        if cmd != "config":  # config must run even if the file is broken
+            config(d)
+        COMMANDS[cmd](d, sys.argv[2:])
+    except OSError as e:
+        die("%s: %s." % (pretty(e.filename or memory_dir()), e.strerror or e))
+
+
+if __name__ == "__main__":
+    main()
